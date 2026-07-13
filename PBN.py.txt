@@ -1,0 +1,1009 @@
+import json
+import math
+import os
+import re
+import sqlite3
+import sys
+from collections import Counter, defaultdict
+from datetime import datetime, timezone
+from html import unescape
+from html.parser import HTMLParser
+
+try:
+    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+except ImportError:
+    SentimentIntensityAnalyzer = None
+
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer
+except ImportError:
+    TfidfVectorizer = None
+
+
+OWN_LABELS = {"адепт", "основательный"}
+ENEMY_LABELS = {"хейтер", "предатель"}
+ALL_LABELS = {"не определено"} | OWN_LABELS | ENEMY_LABELS
+LABEL_TO_SCORE = {
+    "предатель": -90,
+    "хейтер": -50,
+    "не определено": 0,
+    "адепт": 50,
+    "основательный": 90,
+}
+RU_STOPWORDS = {
+    "что", "это", "как", "для", "или", "если", "так", "вот", "там", "тут", "тоже", "уже",
+    "только", "очень", "когда", "который", "чтобы", "меня", "тебя", "него", "нее", "они",
+    "она", "оно", "кто", "вам", "нам", "них", "его", "ее", "наш", "ваш", "твой", "мой",
+    "просто", "лишь", "после", "перед", "еще", "ещё", "быть", "был", "была", "были", "да",
+    "нет", "ага", "ок", "окей", "yes", "the", "and", "for", "with", "this", "that", "you",
+}
+
+
+class SentimentEngine:
+    def __init__(self):
+        self.vader = SentimentIntensityAnalyzer() if SentimentIntensityAnalyzer else None
+        self.positive_words = (
+            "спасибо", "круто", "отлично", "супер", "молодец", "спс", "thanks", "good", "ok", "топ"
+        )
+        self.negative_words = (
+            "идиот", "бред", "фигня", "дно", "ужас", "дебил", "лох", "ненавиж", "тупой", "позор"
+        )
+
+    def score(self, text):
+        lex = self._lexicon_score(text)
+        if self.vader:
+            try:
+                vader = int(self.vader.polarity_scores(text).get("compound", 0.0) * 100)
+                return max(-100, min(100, int(0.65 * vader + 0.35 * lex)))
+            except Exception:
+                return lex
+        return lex
+
+    def _lexicon_score(self, text):
+        text_l = text.lower()
+        score = 0
+        for w in self.positive_words:
+            score += text_l.count(w) * 10
+        for w in self.negative_words:
+            score -= text_l.count(w) * 12
+        score += min(text_l.count("!"), 3) * 2
+        return max(-100, min(100, score))
+
+
+class UserProfile:
+    def __init__(self, username):
+        self.username = username
+        self.activity = 0
+        self.benevolence = 0
+        self.relations = defaultdict(int)
+        self.reply_count = 0
+        self.mentions_count = 0
+        self.links_count = 0
+        self.avg_sentiment = 0.0
+        self.manual_label = None
+        self.auto_label = "не определено"
+        self.final_label = "не определено"
+        self.scores = {}
+        self.token_counts = Counter()
+        self.bigram_counts = Counter()
+        self.total_tokens = 0
+        self.total_bigrams = 0
+        self.keywords = []
+        self.keyphrases = []
+        self.updated_at = datetime.now(timezone.utc).isoformat()
+
+    def add_message(self):
+        self.activity += 1
+
+    def update_benevolence(self, value):
+        self.benevolence = max(-100, min(100, self.benevolence + value))
+
+
+class TelegramTextParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.parts = []
+
+    def handle_data(self, data):
+        self.parts.append(data)
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "br":
+            self.parts.append("\n")
+
+    def get_text(self):
+        return "".join(self.parts).strip()
+
+
+class Analyzer:
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self.conn = sqlite3.connect(db_path)
+        self.conn.row_factory = sqlite3.Row
+        self.users = {}
+        self.processed_files = {}
+        self.graph_neighbors = defaultdict(set)
+        self.graph_signed = defaultdict(lambda: {"sum": 0, "count": 0, "positive": 0, "negative": 0})
+        self.total_messages = 0
+        self.self_names = set()
+        self.sentiment_engine = SentimentEngine()
+        self._init_db()
+        self.load_from_db()
+
+    def _init_db(self):
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                username TEXT PRIMARY KEY,
+                activity INTEGER NOT NULL DEFAULT 0,
+                benevolence INTEGER NOT NULL DEFAULT 0,
+                reply_count INTEGER NOT NULL DEFAULT 0,
+                mentions_count INTEGER NOT NULL DEFAULT 0,
+                links_count INTEGER NOT NULL DEFAULT 0,
+                avg_sentiment REAL NOT NULL DEFAULT 0,
+                manual_label TEXT,
+                auto_label TEXT NOT NULL DEFAULT 'не определено',
+                final_label TEXT NOT NULL DEFAULT 'не определено',
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                total_bigrams INTEGER NOT NULL DEFAULT 0,
+                scores_json TEXT NOT NULL DEFAULT '{}',
+                token_counts_json TEXT NOT NULL DEFAULT '{}',
+                bigram_counts_json TEXT NOT NULL DEFAULT '{}',
+                keywords_json TEXT NOT NULL DEFAULT '[]',
+                keyphrases_json TEXT NOT NULL DEFAULT '[]',
+                updated_at TEXT
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS relations (
+                source TEXT NOT NULL,
+                target TEXT NOT NULL,
+                weight_sum INTEGER NOT NULL DEFAULT 0,
+                mentions_count INTEGER NOT NULL DEFAULT 0,
+                positive_count INTEGER NOT NULL DEFAULT 0,
+                negative_count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (source, target)
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS processed_files (
+                path TEXT PRIMARY KEY,
+                mtime REAL NOT NULL,
+                size INTEGER NOT NULL,
+                processed_messages INTEGER NOT NULL DEFAULT 0,
+                last_scanned_at TEXT
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+            """
+        )
+        self._ensure_column("users", "total_bigrams", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("users", "bigram_counts_json", "TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_column("users", "keywords_json", "TEXT NOT NULL DEFAULT '[]'")
+        self._ensure_column("users", "keyphrases_json", "TEXT NOT NULL DEFAULT '[]'")
+        self.conn.commit()
+
+    def _ensure_column(self, table, column, definition):
+        cols = [row[1] for row in self.conn.execute(f"PRAGMA table_info({table})")]
+        if column not in cols:
+            self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    def load_from_db(self):
+        self.users.clear()
+        self.processed_files.clear()
+        self.graph_neighbors.clear()
+        self.graph_signed.clear()
+
+        cur = self.conn.cursor()
+        for row in cur.execute("SELECT * FROM users"):
+            user = UserProfile(row["username"])
+            user.activity = row["activity"]
+            user.benevolence = row["benevolence"]
+            user.reply_count = row["reply_count"]
+            user.mentions_count = row["mentions_count"]
+            user.links_count = row["links_count"]
+            user.avg_sentiment = row["avg_sentiment"]
+            user.manual_label = row["manual_label"]
+            user.auto_label = row["auto_label"] or "не определено"
+            user.final_label = row["final_label"] or "не определено"
+            user.total_tokens = row["total_tokens"] or 0
+            user.total_bigrams = row["total_bigrams"] or 0
+            user.scores = json.loads(row["scores_json"] or "{}")
+            user.token_counts = Counter(json.loads(row["token_counts_json"] or "{}"))
+            user.bigram_counts = Counter(json.loads(row["bigram_counts_json"] or "{}"))
+            user.keywords = json.loads(row["keywords_json"] or "[]")
+            user.keyphrases = json.loads(row["keyphrases_json"] or "[]")
+            user.updated_at = row["updated_at"] or datetime.now(timezone.utc).isoformat()
+            self.users[user.username] = user
+
+        for row in cur.execute("SELECT * FROM relations"):
+            source = row["source"]
+            target = row["target"]
+            if source not in self.users:
+                self.users[source] = UserProfile(source)
+            if target not in self.users:
+                self.users[target] = UserProfile(target)
+            weight = row["weight_sum"]
+            self.users[source].relations[target] = weight
+            self.graph_neighbors[source].add(target)
+            self.graph_neighbors[target].add(source)
+            edge = tuple(sorted((source, target)))
+            self.graph_signed[edge] = {
+                "sum": weight,
+                "count": row["mentions_count"],
+                "positive": row["positive_count"],
+                "negative": row["negative_count"],
+            }
+
+        for row in cur.execute("SELECT * FROM processed_files"):
+            self.processed_files[row["path"]] = {
+                "mtime": row["mtime"],
+                "size": row["size"],
+                "processed_messages": row["processed_messages"],
+            }
+
+        total_messages_raw = self._meta_get("total_messages")
+        self.total_messages = int(total_messages_raw) if total_messages_raw else 0
+        own_raw = self._meta_get("self_names")
+        self.self_names = {x.strip() for x in (own_raw or "").split(",") if x.strip()}
+
+    def save_to_db(self):
+        cur = self.conn.cursor()
+        cur.execute("DELETE FROM users")
+        cur.execute("DELETE FROM relations")
+        cur.execute("DELETE FROM processed_files")
+
+        for user in self.users.values():
+            cur.execute(
+                """
+                INSERT INTO users (
+                    username, activity, benevolence, reply_count, mentions_count, links_count,
+                    avg_sentiment, manual_label, auto_label, final_label, total_tokens, total_bigrams,
+                    scores_json, token_counts_json, bigram_counts_json, keywords_json, keyphrases_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user.username,
+                    user.activity,
+                    user.benevolence,
+                    user.reply_count,
+                    user.mentions_count,
+                    user.links_count,
+                    user.avg_sentiment,
+                    user.manual_label,
+                    user.auto_label,
+                    user.final_label,
+                    user.total_tokens,
+                    user.total_bigrams,
+                    json.dumps(user.scores, ensure_ascii=False),
+                    json.dumps(dict(user.token_counts), ensure_ascii=False),
+                    json.dumps(dict(user.bigram_counts), ensure_ascii=False),
+                    json.dumps(user.keywords, ensure_ascii=False),
+                    json.dumps(user.keyphrases, ensure_ascii=False),
+                    user.updated_at,
+                ),
+            )
+
+        for source, user in self.users.items():
+            for target, weight in user.relations.items():
+                edge = tuple(sorted((source, target)))
+                sign = self.graph_signed.get(edge, {"count": 0, "positive": 0, "negative": 0})
+                cur.execute(
+                    """
+                    INSERT OR REPLACE INTO relations (
+                        source, target, weight_sum, mentions_count, positive_count, negative_count
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (source, target, weight, sign["count"], sign["positive"], sign["negative"]),
+                )
+
+        for path, info in self.processed_files.items():
+            cur.execute(
+                """
+                INSERT OR REPLACE INTO processed_files (
+                    path, mtime, size, processed_messages, last_scanned_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    path,
+                    info["mtime"],
+                    info["size"],
+                    info.get("processed_messages", 0),
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+
+        self._meta_set("total_messages", str(self.total_messages))
+        self._meta_set("self_names", ",".join(sorted(self.self_names)))
+        self.conn.commit()
+
+    def _meta_get(self, key):
+        row = self.conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else None
+
+    def _meta_set(self, key, value):
+        self.conn.execute(
+            "INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
+
+    def get_or_create_user(self, username):
+        if username not in self.users:
+            self.users[username] = UserProfile(username)
+        return self.users[username]
+
+    def parse_directory(self, directory, force=False):
+        total_parsed = 0
+        files_found = 0
+        files_scanned = 0
+        files_skipped = 0
+        files_with_messages = 0
+        for root, _, files in os.walk(directory):
+            for filename in files:
+                if filename.lower().endswith(".html"):
+                    files_found += 1
+                    file_path = os.path.join(root, filename)
+                    parsed = self.parse_file(file_path, force=force)
+                    if parsed is None:
+                        files_skipped += 1
+                        continue
+                    files_scanned += 1
+                    total_parsed += parsed
+                    if parsed > 0:
+                        files_with_messages += 1
+        return {
+            "files_found": files_found,
+            "files_scanned": files_scanned,
+            "files_skipped": files_skipped,
+            "files_with_messages": files_with_messages,
+            "messages_parsed": total_parsed,
+        }
+
+    def parse_file(self, file_path, force=False):
+        try:
+            stat = os.stat(file_path)
+        except FileNotFoundError:
+            return 0
+        mtime = stat.st_mtime
+        size = stat.st_size
+
+        info = self.processed_files.get(file_path)
+        if (not force) and info and info.get("mtime") == mtime and info.get("size") == size:
+            return None
+
+        parsed_count = 0
+        with open(file_path, "r", encoding="utf-8") as f:
+            html = f.read()
+            for message in self.extract_telegram_messages(html):
+                self.parse_message(message)
+                parsed_count += 1
+
+        self.processed_files[file_path] = {
+            "mtime": mtime,
+            "size": size,
+            "processed_messages": parsed_count,
+        }
+        return parsed_count
+
+    def parse_message(self, message):
+        username = message.get("username")
+        text = message.get("text", "")
+        if not username:
+            return
+
+        user = self.get_or_create_user(username)
+        user.add_message()
+        self.total_messages += 1
+
+        sentiment = self.estimate_sentiment(text)
+        user.update_benevolence(sentiment)
+        user.avg_sentiment = ((user.avg_sentiment * (user.activity - 1)) + sentiment) / max(1, user.activity)
+        mentions = self.extract_mentions(text)
+        user.mentions_count += len(mentions)
+        user.links_count += len(re.findall(r"https?://|t\.me/|@\w+", text, flags=re.IGNORECASE))
+
+        if message.get("reply_to"):
+            user.reply_count += 1
+
+        tokens = self.tokenize(text)
+        bigrams = self.make_bigrams(tokens)
+        user.total_tokens += len(tokens)
+        user.total_bigrams += len(bigrams)
+        user.token_counts.update(tokens)
+        user.bigram_counts.update(bigrams)
+
+        for target in mentions:
+            target_user = self.get_or_create_user(target)
+            user.relations[target_user.username] += sentiment
+            edge = tuple(sorted((user.username, target_user.username)))
+            signed = self.graph_signed[edge]
+            signed["sum"] += sentiment
+            signed["count"] += 1
+            if sentiment > 0:
+                signed["positive"] += 1
+            elif sentiment < 0:
+                signed["negative"] += 1
+            self.graph_neighbors[user.username].add(target_user.username)
+            self.graph_neighbors[target_user.username].add(user.username)
+
+        user.updated_at = datetime.now(timezone.utc).isoformat()
+
+    def extract_telegram_messages(self, html):
+        messages = []
+        blocks = re.findall(
+            r'<div class="message default clearfix".*?(?=<div class="message (?:default clearfix|service)"|\Z)',
+            html,
+            flags=re.DOTALL,
+        )
+        for block in blocks:
+            username = self.extract_first_group(r'<div class="from_name">\s*(.*?)\s*</div>', block)
+            text_html = self.extract_first_group(r'<div class="text">\s*(.*?)\s*</div>', block)
+            reply_to = self.extract_first_group(r"GoToMessage\((\d+)\)|go_to_message(\d+)", block)
+            parser = TelegramTextParser()
+            parser.feed(text_html or "")
+            text = self.clean_text(parser.get_text())
+            if username:
+                messages.append(
+                    {
+                        "username": self.clean_text(username),
+                        "text": text,
+                        "reply_to": reply_to,
+                    }
+                )
+        return messages
+
+    def extract_first_group(self, pattern, text):
+        match = re.search(pattern, text, flags=re.DOTALL)
+        if not match:
+            return None
+        groups = [g for g in match.groups() if g]
+        return groups[0] if groups else match.group(1)
+
+    def clean_text(self, text):
+        return re.sub(r"\s+", " ", unescape(text)).strip()
+
+    def extract_mentions(self, text):
+        return re.findall(r"@([\w\d_]{3,})", text)
+
+    def tokenize(self, text):
+        raw = re.findall(r"[a-zA-Zа-яА-ЯёЁ0-9_]{3,}", text.lower())
+        return [t for t in raw if t not in RU_STOPWORDS]
+
+    def make_bigrams(self, tokens):
+        if len(tokens) < 2:
+            return []
+        return [f"{tokens[i]} {tokens[i + 1]}" for i in range(len(tokens) - 1)]
+
+    def estimate_sentiment(self, text):
+        return self.sentiment_engine.score(text)
+
+    def set_manual_label(self, username, label):
+        if label not in ALL_LABELS:
+            raise ValueError("Недопустимая метка")
+        user = self.get_or_create_user(username)
+        user.manual_label = None if label == "не определено" else label
+        user.final_label = label
+        user.updated_at = datetime.now(timezone.utc).isoformat()
+
+    def score_to_label(self, score):
+        if score <= -75:
+            return "предатель"
+        if score <= -25:
+            return "хейтер"
+        if score <= 24:
+            return "не определено"
+        if score <= 74:
+            return "адепт"
+        return "основательный"
+
+    def _anchor_groups(self):
+        own_anchors = set()
+        enemy_anchors = set()
+        for username, user in self.users.items():
+            if user.manual_label in OWN_LABELS:
+                own_anchors.add(username)
+            elif user.manual_label in ENEMY_LABELS:
+                enemy_anchors.add(username)
+        for own in self.self_names:
+            for username in self.users:
+                ul = username.lower()
+                ol = own.lower()
+                if ol in ul or ul in ol:
+                    own_anchors.add(username)
+        return own_anchors, enemy_anchors
+
+    def _build_phrase_models(self, own_anchors, enemy_anchors):
+        own_counts = Counter()
+        enemy_counts = Counter()
+        own_total = 0
+        enemy_total = 0
+        for username in own_anchors:
+            user = self.users.get(username)
+            if not user:
+                continue
+            own_counts.update(user.token_counts)
+            own_total += user.total_tokens
+        for username in enemy_anchors:
+            user = self.users.get(username)
+            if not user:
+                continue
+            enemy_counts.update(user.token_counts)
+            enemy_total += user.total_tokens
+        vocab_size = max(1, len(set(own_counts) | set(enemy_counts)))
+        return own_counts, enemy_counts, own_total, enemy_total, vocab_size
+
+    def _phrase_score(self, user, own_counts, enemy_counts, own_total, enemy_total, vocab_size):
+        if own_total == 0 or enemy_total == 0 or user.total_tokens == 0:
+            return 0.0
+        score = 0.0
+        checked = 0
+        for tok, cnt in user.token_counts.items():
+            if cnt < 2:
+                continue
+            p_own = (own_counts[tok] + 1.0) / (own_total + vocab_size)
+            p_enemy = (enemy_counts[tok] + 1.0) / (enemy_total + vocab_size)
+            score += math.log(p_own / p_enemy) * min(cnt, 6)
+            checked += 1
+            if checked > 200:
+                break
+        return max(-30.0, min(30.0, score * 2.0))
+
+    def _refresh_keywords(self, top_n=12):
+        for user in self.users.values():
+            user.keywords = [w for w, _ in user.token_counts.most_common(top_n)]
+            user.keyphrases = [w for w, _ in user.bigram_counts.most_common(top_n)]
+
+    def _anchor_keyword_score(self, user, own_anchors, enemy_anchors):
+        own_kw = Counter()
+        enemy_kw = Counter()
+        for name in own_anchors:
+            target = self.users.get(name)
+            if target:
+                own_kw.update(target.token_counts)
+        for name in enemy_anchors:
+            target = self.users.get(name)
+            if target:
+                enemy_kw.update(target.token_counts)
+
+        own_top = {w for w, _ in own_kw.most_common(300)}
+        enemy_top = {w for w, _ in enemy_kw.most_common(300)}
+        user_top = {w for w, _ in user.token_counts.most_common(80)}
+        if not user_top:
+            return 0.0
+        own_overlap = len(user_top & own_top)
+        enemy_overlap = len(user_top & enemy_top)
+        return max(-18.0, min(18.0, (own_overlap - enemy_overlap) * 1.5))
+
+    def _tfidf_protocol_score(self, own_anchors, enemy_anchors):
+        if not TfidfVectorizer:
+            return {}
+        docs = []
+        users_order = []
+        for username, user in self.users.items():
+            if user.total_tokens < 20:
+                continue
+            tokens = []
+            for token, cnt in user.token_counts.most_common(300):
+                tokens.extend([token] * min(cnt, 4))
+            if not tokens:
+                continue
+            docs.append(" ".join(tokens))
+            users_order.append(username)
+        if len(docs) < 10:
+            return {}
+        try:
+            vectorizer = TfidfVectorizer(max_features=3000, ngram_range=(1, 2), min_df=2)
+            matrix = vectorizer.fit_transform(docs)
+        except Exception:
+            return {}
+
+        user_idx = {u: i for i, u in enumerate(users_order)}
+        own_idx = [user_idx[u] for u in own_anchors if u in user_idx]
+        enemy_idx = [user_idx[u] for u in enemy_anchors if u in user_idx]
+        if not own_idx or not enemy_idx:
+            return {}
+
+        own_centroid = matrix[own_idx].mean(axis=0)
+        enemy_centroid = matrix[enemy_idx].mean(axis=0)
+        scores = {}
+        for username, idx in user_idx.items():
+            vec = matrix[idx]
+            own_sim = float((vec @ own_centroid.T).A[0][0])
+            enemy_sim = float((vec @ enemy_centroid.T).A[0][0])
+            scores[username] = max(-22.0, min(22.0, (own_sim - enemy_sim) * 120.0))
+        return scores
+
+    def auto_classify(self):
+        if not self.users:
+            return
+
+        self._refresh_keywords()
+        own_anchors, enemy_anchors = self._anchor_groups()
+        own_counts, enemy_counts, own_total, enemy_total, vocab_size = self._build_phrase_models(own_anchors, enemy_anchors)
+        tfidf_scores = self._tfidf_protocol_score(own_anchors, enemy_anchors)
+
+        activities = [u.activity for u in self.users.values()]
+        max_activity = max(activities) if activities else 1
+        avg_activity = (sum(activities) / len(activities)) if activities else 0
+        base_scores = {}
+        diagnostics = {}
+        for username, user in self.users.items():
+            activity_score = min(16, int((user.activity / max(1, max_activity)) * 16))
+            reliability_score = 6 if user.activity >= avg_activity else 0
+
+            own_positive = 0
+            enemy_positive = 0
+            enemy_negative = 0
+            reciprocal_positive = 0
+            bridge_enemy_ratio = 0.0
+            for neigh in self.graph_neighbors.get(username, set()):
+                edge = tuple(sorted((username, neigh)))
+                sign = self.graph_signed.get(edge, {"positive": 0, "negative": 0})
+                if neigh in own_anchors and sign["positive"] > 0:
+                    own_positive += 1
+                if neigh in enemy_anchors:
+                    if sign["positive"] > 0:
+                        enemy_positive += 1
+                    if sign["negative"] > 0:
+                        enemy_negative += 1
+                backward = self.users.get(neigh).relations.get(username, 0) if self.users.get(neigh) else 0
+                if sign["positive"] > 0 and backward > 0:
+                    reciprocal_positive += 1
+
+            total_neighbors = len(self.graph_neighbors.get(username, set()))
+            if total_neighbors > 0:
+                bridge_enemy_ratio = enemy_positive / total_neighbors
+
+            # Мягкое правило: 3+ позитивных контакта с враждебным кластером.
+            enemy_cluster_penalty = -18 if (user.manual_label is None and enemy_positive >= 3) else 0
+            anchor_affinity = (own_positive * 8) - (enemy_positive * 8) + (enemy_negative * 3)
+            phrase = self._phrase_score(user, own_counts, enemy_counts, own_total, enemy_total, vocab_size)
+            keyword_protocol = self._anchor_keyword_score(user, own_anchors, enemy_anchors)
+            tfidf_protocol = tfidf_scores.get(username, 0.0)
+            reciprocity_protocol = min(12, reciprocal_positive * 2)
+            bridge_penalty = -min(15, int(bridge_enemy_ratio * 30))
+            sentiment_component = int(user.avg_sentiment / 14)
+            benevolence_component = int(user.benevolence / 24)
+
+            base_score = (
+                activity_score
+                + reliability_score
+                + anchor_affinity
+                + enemy_cluster_penalty
+                + phrase
+                + keyword_protocol
+                + tfidf_protocol
+                + reciprocity_protocol
+                + bridge_penalty
+                + sentiment_component
+                + benevolence_component
+            )
+            base_scores[username] = max(-100, min(100, float(base_score)))
+            diagnostics[username] = {
+                "activity": activity_score,
+                "reliability": reliability_score,
+                "anchor_affinity": anchor_affinity,
+                "enemy_cluster_penalty": enemy_cluster_penalty,
+                "phrase_model": round(phrase, 2),
+                "keyword_protocol": round(keyword_protocol, 2),
+                "tfidf_protocol": round(tfidf_protocol, 2),
+                "reciprocity_protocol": reciprocity_protocol,
+                "bridge_penalty": bridge_penalty,
+                "avg_sentiment": round(user.avg_sentiment, 2),
+                "benevolence": user.benevolence,
+                "own_positive_links": own_positive,
+                "enemy_positive_links": enemy_positive,
+                "enemy_negative_links": enemy_negative,
+                "reciprocal_positive": reciprocal_positive,
+            }
+
+        # Якоря: ручные метки и self_names.
+        fixed_scores = {}
+        for username, user in self.users.items():
+            if user.manual_label:
+                fixed_scores[username] = LABEL_TO_SCORE.get(user.manual_label, 0)
+        for username in own_anchors:
+            if username not in fixed_scores:
+                fixed_scores[username] = 85
+
+        scores = dict(base_scores)
+        for username, score in fixed_scores.items():
+            scores[username] = float(score)
+
+        # Передача "через рукопожатия":
+        # step=1: + x/5 от соседа при позитиве, - x/5 при негативе.
+        # Далее влияние затухает по шагам (depth_decay) и по насыщению цели.
+        max_depth = 4
+        depth_decay = 0.68
+        for step in range(1, max_depth + 1):
+            decay = depth_decay ** (step - 1)
+            delta = defaultdict(float)
+            for source, source_score in scores.items():
+                neighbors = self.graph_neighbors.get(source, set())
+                if not neighbors or abs(source_score) < 1:
+                    continue
+                for target in neighbors:
+                    edge = tuple(sorted((source, target)))
+                    sign_info = self.graph_signed.get(edge, {"sum": 0, "count": 0, "positive": 0, "negative": 0})
+                    cnt = max(1, sign_info["count"])
+                    polarity = (sign_info["positive"] - sign_info["negative"]) / cnt
+                    if abs(polarity) < 0.15:
+                        continue
+
+                    raw_transfer = (source_score / 5.0) * polarity * decay
+                    # Чем сильнее уже выражен target, тем меньше дополнительное влияние.
+                    saturation = 1.0 + (abs(scores.get(target, 0.0)) / 35.0)
+                    transfer = raw_transfer / saturation
+                    delta[target] += transfer
+
+            for username, add in delta.items():
+                if username in fixed_scores:
+                    continue
+                scores[username] = max(-100.0, min(100.0, scores.get(username, 0.0) + add))
+
+        for username, user in self.users.items():
+            final_score = int(round(max(-100, min(100, scores.get(username, 0.0)))))
+            auto_label = self.score_to_label(final_score)
+            if user.manual_label:
+                final_label = user.manual_label
+            else:
+                final_label = auto_label
+
+            user.auto_label = auto_label
+            user.final_label = final_label
+            user.scores = {
+                "final": final_score,
+                "base_score": round(base_scores.get(username, 0.0), 2),
+                "network_score": round(scores.get(username, 0.0) - base_scores.get(username, 0.0), 2),
+                "anchors_own_total": len(own_anchors),
+                "anchors_enemy_total": len(enemy_anchors),
+                "handshake_max_depth": max_depth,
+                "handshake_decay": depth_decay,
+                **diagnostics.get(username, {}),
+            }
+            user.updated_at = datetime.now(timezone.utc).isoformat()
+
+    def generate_report(self, username):
+        user = self.users.get(username)
+        if not user:
+            return "Пользователь не найден"
+        lines = [
+            f"Досье: {user.username}",
+            f"Активность: {user.activity} сообщений",
+            f"Средняя тональность: {round(user.avg_sentiment, 2)} | Благонадёжность: {user.benevolence}",
+            f"Ответов: {user.reply_count}, упоминаний: {user.mentions_count}, ссылок: {user.links_count}",
+            f"Ручная метка: {user.manual_label or 'нет'}",
+            f"Авто метка: {user.auto_label}",
+            f"Итоговая метка: {user.final_label}",
+            f"Скор: {user.scores.get('final', 'n/a')}",
+            f"Ключевые слова: {', '.join(user.keywords[:10]) if user.keywords else 'нет'}",
+            f"Ключевые фразы: {', '.join(user.keyphrases[:8]) if user.keyphrases else 'нет'}",
+            "Протоколы:",
+        ]
+        for k, v in user.scores.items():
+            if k == "final":
+                continue
+            lines.append(f"  - {k}: {v}")
+        if user.relations:
+            lines.append("Связи (топ-10):")
+            top_rel = sorted(user.relations.items(), key=lambda x: abs(x[1]), reverse=True)[:10]
+            for target, score in top_rel:
+                lines.append(f"  {target}: {score}")
+        return "\n".join(lines)
+
+    def collect_stats(self):
+        labels = Counter(u.final_label for u in self.users.values())
+        unknown = [u for u in self.users.values() if u.final_label == "не определено"]
+        uncertain = sorted(unknown, key=lambda u: abs(u.scores.get("final", 0)))
+        own_anchors, enemy_anchors = self._anchor_groups()
+        lines = [
+            f"Всего пользователей: {len(self.users)}",
+            f"Всего сообщений: {self.total_messages}",
+            f"Обработано файлов: {len(self.processed_files)}",
+            f"Якоря свои: {len(own_anchors)}",
+            f"Якоря чужие: {len(enemy_anchors)}",
+            "Список якорей (свои):",
+            ("  " + ", ".join(sorted(own_anchors)[:80])) if own_anchors else "  нет",
+            "Список якорей (чужие):",
+            ("  " + ", ".join(sorted(enemy_anchors)[:80])) if enemy_anchors else "  нет",
+            "Распределение итоговых меток:",
+        ]
+        for label, cnt in labels.most_common():
+            lines.append(f"  {label}: {cnt}")
+        lines.append("Кого стоит разметить вручную (топ-10 самых неопределённых):")
+        for u in uncertain[:10]:
+            lines.append(f"  {u.username} | score={u.scores.get('final', 0)} | msg={u.activity}")
+        return "\n".join(lines)
+
+    def list_by_category(self, category=None, limit=50):
+        if category and category not in ALL_LABELS:
+            return f"Неизвестная категория: {category}"
+        groups = defaultdict(list)
+        for user in self.users.values():
+            groups[user.final_label].append(user)
+        for label in groups:
+            groups[label].sort(key=lambda u: (u.scores.get("final", 0), u.activity), reverse=True)
+
+        lines = []
+        if category:
+            items = groups.get(category, [])
+            lines.append(f"Категория: {category} (всего {len(items)})")
+            for u in items[:limit]:
+                lines.append(f"  {u.username} | score={u.scores.get('final', 0)} | msg={u.activity}")
+            return "\n".join(lines)
+
+        lines.append("Пользователи по категориям:")
+        for label in ["основательный", "адепт", "не определено", "хейтер", "предатель"]:
+            items = groups.get(label, [])
+            lines.append(f"\n{label.upper()} (всего {len(items)}):")
+            for u in items[:limit]:
+                lines.append(f"  {u.username} | score={u.scores.get('final', 0)} | msg={u.activity}")
+        return "\n".join(lines)
+
+    def find_suspicious(self, threshold=3):
+        _, enemy_anchors = self._anchor_groups()
+        suspects = []
+        for username, user in self.users.items():
+            if user.final_label in ENEMY_LABELS:
+                continue
+            enemy_pos_links = 0
+            for neigh in self.graph_neighbors.get(username, set()):
+                if neigh not in enemy_anchors:
+                    continue
+                edge = tuple(sorted((username, neigh)))
+                sign = self.graph_signed.get(edge, {"positive": 0})
+                if sign["positive"] > 0:
+                    enemy_pos_links += 1
+            if enemy_pos_links >= threshold:
+                suspects.append((username, enemy_pos_links))
+        suspects.sort(key=lambda x: x[1], reverse=True)
+        return suspects
+
+    def close(self):
+        self.save_to_db()
+        self.conn.close()
+
+
+def main_menu(analyzer):
+    while True:
+        print("\nМеню:")
+        print("1. Просмотреть досье")
+        print("2. Добавить/изменить ручную метку")
+        print("3. Обновить анализ по ChatExport")
+        print("4. Найти подозрительных (протокол 3+ чужих)")
+        print("5. Показать статистику")
+        print("6. Вывести пользователей по категориям")
+        print("7. Выйти")
+        choice = input("Выберите опцию: ").strip()
+
+        if choice == "1":
+            username = input("Имя пользователя: ").strip()
+            print(analyzer.generate_report(username))
+
+        elif choice == "2":
+            username = input("Имя пользователя: ").strip()
+            print("Категории:")
+            print("1) Предатель (чужой)")
+            print("2) Хейтер (чужой, мягко)")
+            print("3) Не определено")
+            print("4) Адепт (свой)")
+            print("5) Основательный (свой)")
+            opt = input("Категория: ").strip()
+            labels = {"1": "предатель", "2": "хейтер", "3": "не определено", "4": "адепт", "5": "основательный"}
+            label = labels.get(opt, "не определено")
+            analyzer.set_manual_label(username, label)
+            analyzer.auto_classify()
+            analyzer.save_to_db()
+            print(f"Ручная метка для {username}: {label}")
+
+        elif choice == "3":
+            try:
+                from pbn_app.paths import default_exports_scan_dir
+
+                default_dir = str(default_exports_scan_dir())
+            except Exception:
+                default_dir = os.path.dirname(os.path.abspath(__file__))
+            directory = input(f"Папка с экспортами (Enter = {default_dir}): ").strip().strip('"')
+            if not directory:
+                directory = default_dir
+            force = input("Пересканировать даже обработанные файлы? (y/N): ").strip().lower() == "y"
+            if not analyzer.self_names:
+                own_raw = input("Ваши ники через запятую (якорь 'свои', можно пусто): ").strip()
+                if own_raw:
+                    analyzer.self_names = {x.strip() for x in own_raw.split(",") if x.strip()}
+
+            result = analyzer.parse_directory(directory, force=force)
+            analyzer.auto_classify()
+            analyzer.save_to_db()
+            print(
+                "Анализ обновлён.\n"
+                f"HTML найдено: {result['files_found']}\n"
+                f"Проверено файлов: {result['files_scanned']}\n"
+                f"Пропущено (без изменений): {result['files_skipped']}\n"
+                f"С файлами с сообщениями: {result['files_with_messages']}\n"
+                f"Новых сообщений: {result['messages_parsed']}"
+            )
+            if result["files_found"] == 0:
+                print(
+                    "Внимание: HTML не найдено. Проверьте путь и кодировку консоли.\n"
+                    "Совет: вставьте путь без лишних кавычек."
+                )
+
+        elif choice == "4":
+            suspects = analyzer.find_suspicious(threshold=3)
+            if not suspects:
+                print("Подозрительных не найдено.")
+            else:
+                print("Подозрительные (много позитивных связей с отмеченными чужими):")
+                for username, links in suspects[:30]:
+                    print(f"  {username}: +связей с чужими = {links}")
+
+        elif choice == "5":
+            print(analyzer.collect_stats())
+
+        elif choice == "6":
+            print("Категории: основательный, адепт, не определено, хейтер, предатель, all")
+            raw = input("Введите категорию (или all): ").strip().lower()
+            if raw == "all" or raw == "":
+                print(analyzer.list_by_category(category=None, limit=50))
+            else:
+                print(analyzer.list_by_category(category=raw, limit=200))
+
+        elif choice == "7":
+            analyzer.close()
+            print("Состояние сохранено. До свидания!")
+            break
+        else:
+            print("Некорректный выбор")
+
+
+def root_menu(analyzer):
+    """Сначала панель бота (журнал, токен), затем — старое меню анализа."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    if script_dir not in sys.path:
+        sys.path.insert(0, script_dir)
+    while True:
+        print("\n=== PBN / MoriTrustNet ===")
+        print("1. Панель: журнал Telegram-бота и настройки (токен, chief id, whitelist)")
+        print("2. Анализатор ChatExport (меню 1–7)")
+        print("3. Выход")
+        choice = input("Выберите опцию: ").strip()
+        if choice == "1":
+            from pbn_app.log_panel import bot_admin_console_menu
+
+            bot_admin_console_menu()
+        elif choice == "2":
+            main_menu(analyzer)
+            break
+        elif choice == "3":
+            analyzer.close()
+            print("До свидания!")
+            break
+        else:
+            print("Некорректный выбор")
+
+
+if __name__ == "__main__":
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    if script_dir not in sys.path:
+        sys.path.insert(0, script_dir)
+    from pbn_app.paths import analyzer_db_path
+
+    db_path = str(analyzer_db_path())
+    analyzer = Analyzer(db_path=db_path)
+    root_menu(analyzer)

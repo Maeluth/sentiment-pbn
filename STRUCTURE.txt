@@ -1,0 +1,31 @@
+MoriTrustNet / PBN — структура папки
+====================================
+
+Корень (Documents\PBN)
+  run_bot.py          — запуск Telegram-бота
+  PBN.py.txt          — исходник анализатора (скопируйте в PBN.py при необходимости)
+  requirements.txt    — pip-зависимости для бота
+
+  pbn_app\            — код бота и общие пути
+    paths.py          — где лежат data/, exports/, какие файлы БД
+    runtime_config.py — settings.db: токен, админы, whitelist, журнал
+    log_panel.py      — консольная панель журнала
+    telegram_bot.py   — логика бота
+
+  data\               — базы (удобно бэкапить одной папкой)
+    settings.db       — токен, chief_admin_id, whitelist, лог обращений к боту
+    analyzer_state.db — сюда можно перенести тяжёлую БД анализатора (см. ниже)
+
+  exports\            — по желанию: перенесите сюда папки ChatExport_* для порядка
+                      — если пусто, по умолчанию сканируется весь корень PBN
+
+Устаревшие имена (подхватываются автоматически, пока не переехали):
+  analyzer_state.db в корне
+  pbn_settings.db в корне
+
+Первый запуск бота
+------------------
+1) pip install -r requirements.txt
+2) Запустить анализатор: python PBN.py.txt (или PBN.py)
+3) Пункт 1 → панель → пункт 2: ввести токен и свой Telegram user id
+4) python run_bot.py
